@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Чат 1 на 1</title>
+<style>
+:root{--bg:#0f1115;--panel:#181b22;--mine:#2b5cff;--their:#262a33;--text:#eceef3;--muted:#8b93a3;--danger:#ff5a5f}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--text);font:16px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+button{font:inherit;color:inherit;border:0;border-radius:10px;padding:10px 14px;background:var(--their);cursor:pointer}
+button.primary{background:var(--mine)}
+button:disabled{opacity:.5}
+input[type=text]{font:inherit;color:var(--text);background:var(--panel);border:1px solid #2c313c;border-radius:10px;padding:10px 12px;width:100%}
+#lobby{display:flex;flex-direction:column;gap:14px;max-width:420px;margin:0 auto;padding:40px 20px}
+#lobby h1{margin:0 0 4px;font-size:24px}
+.muted{color:var(--muted);font-size:14px}
+.row{display:flex;gap:8px}
+#chat{display:none;height:100dvh;flex-direction:column}
+header{display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--panel);border-bottom:1px solid #232733}
+#dot{width:10px;height:10px;border-radius:50%;background:#e0a100}
+#dot.on{background:#2fc46b}
+#status{flex:1;font-size:14px}
+#list{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:8px}
+.msg{max-width:82%;padding:8px 12px;border-radius:14px;background:var(--their);align-self:flex-start;word-break:break-word}
+.msg.mine{background:var(--mine);align-self:flex-end}
+.msg .text{white-space:pre-wrap}
+.msg img{max-width:100%;max-height:300px;border-radius:8px;display:block}
+.msg audio{max-width:100%;width:240px}
+.meta{display:flex;gap:8px;align-items:center;margin-top:4px;font-size:12px;opacity:.85;flex-wrap:wrap}
+.meta button{padding:3px 8px;font-size:12px;background:rgba(255,255,255,.14)}
+.meta button.del{background:rgba(255,90,95,.3)}
+.meta .time{margin-right:auto}
+.gone{font-style:italic;opacity:.6}
+#bar{display:flex;gap:8px;padding:10px;padding-bottom:calc(10px + env(safe-area-inset-bottom));background:var(--panel);border-top:1px solid #232733;align-items:flex-end}
+#text{flex:1;resize:none;max-height:120px;font:inherit;color:var(--text);background:var(--bg);border:1px solid #2c313c;border-radius:12px;padding:10px 12px}
+#rec.on{background:var(--danger)}
+#toast{position:fixed;left:50%;bottom:90px;transform:translateX(-50%);background:#000c;padding:8px 14px;border-radius:10px;display:none;font-size:14px}
+</style>
+</head>
+<body>
+
+<div id="lobby">
+  <h1>Чат 1 на 1</h1>
+  <div class="muted">Напрямую между двумя устройствами, без сервера. Оба должны быть онлайн одновременно. История нигде не сохраняется.</div>
+  <button class="primary" id="create">Создать комнату</button>
+  <div class="muted">или войти по коду друга:</div>
+  <div class="row">
+    <input type="text" id="code" placeholder="Код комнаты" autocapitalize="characters" autocomplete="off">
+    <button id="join">Войти</button>
+  </div>
+  <div class="muted" id="lobbyMsg"></div>
+</div>
+
+<div id="chat">
+  <header>
+    <div id="dot"></div>
+    <div id="status">Подключение…</div>
+    <button id="share">Ссылка</button>
+  </header>
+  <div id="list"></div>
+  <div id="bar">
+    <input type="file" id="file" accept="image/*,audio/*" multiple hidden>
+    <button id="attach" title="Фото или аудио">📎</button>
+    <button id="rec" title="Голосовое">🎤</button>
+    <textarea id="text" rows="1" placeholder="Сообщение"></textarea>
+    <button class="primary" id="send">➤</button>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+const PREFIX = 'dovchat-';
+const MAX_BYTES = 20 * 1024 * 1024;
+const $ = id => document.getElementById(id);
+let peer = null, conn = null, roomCode = '';
+const msgs = new Map(); // id -> {m, mine, el}
+
+function toast(t){ const el=$('toast'); el.textContent=t; el.style.display='block'; clearTimeout(toast.t); toast.t=setTimeout(()=>el.style.display='none',2500); }
+function rid(n=6){ const a='ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; let s=''; for(let i=0;i<n;i++) s+=a[Math.floor(Math.random()*a.length)]; return s; }
+function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,8); }
+function setStatus(on, text){ $('dot').className = on ? 'on' : ''; $('status').textContent = text; }
+function showChat(){ $('lobby').style.display='none'; $('chat').style.display='flex'; }
+
+// ---------- connection ----------
+function createRoom(){
+  roomCode = rid();
+  peer = new Peer(PREFIX + roomCode);
+  peer.on('open', () => {
+    location.hash = roomCode;
+    showChat();
+    setStatus(false, 'Комната ' + roomCode + ' — ждём собеседника…');
+  });
+  peer.on('connection', c => { if (conn && conn.open) { c.close(); return; } setupConn(c); });
+  peer.on('error', e => {
+    if (e.type === 'unavailable-id') { peer.destroy(); createRoom(); return; }
+    $('lobbyMsg').textContent = 'Ошибка: ' + e.type;
+  });
+}
+function joinRoom(code){
+  code = (code||'').trim().toUpperCase();
+  if (!code) return;
+  roomCode = code;
+  $('lobbyMsg').textContent = 'Подключаемся…';
+  peer = new Peer();
+  peer.on('open', () => {
+    const c = peer.connect(PREFIX + code, { reliable: true, serialization: 'binary' });
+    setupConn(c);
+    showChat();
+    setStatus(false, 'Подключение к ' + code + '…');
+  });
+  peer.on('error', e => {
+    const t = e.type === 'peer-unavailable' ? 'Комната не найдена' : 'Ошибка: ' + e.type;
+    if ($('chat').style.display === 'flex') setStatus(false, t); else $('lobbyMsg').textContent = t;
+  });
+}
+function setupConn(c){
+  conn = c;
+  c.on('open', () => setStatus(true, 'Собеседник онлайн'));
+  c.on('data', onData);
+  c.on('close', () => { setStatus(false, 'Собеседник отключился'); conn = null; });
+  c.on('error', () => setStatus(false, 'Ошибка соединения'));
+}
+
+// ---------- receive ----------
+function onData(d){
+  if (!d || !d.t) return;
+  if (d.t === 'msg') addMessage(d, false);
+  else if (d.t === 'del') {
+    const r = msgs.get(d.id);
+    if (r && !r.mine) removeMessage(d.id, true);
+  }
+}
+
+// ---------- send ----------
+function canSend(){ if (!conn || !conn.open) { toast('Собеседник не в сети'); return false; } return true; }
+function sendMsg(m){ if (!canSend()) return false; conn.send(m); addMessage(m, true); return true; }
+function sendText(){
+  const v = $('text').value.trim();
+  if (!v) return;
+  if (sendMsg({ t:'msg', id:uid(), kind:'text', text:v, ts:Date.now() })) { $('text').value=''; autoGrow(); }
+}
+async function sendFile(f){
+  if (f.size > MAX_BYTES) { toast('Файл больше 20 МБ: ' + f.name); return; }
+  const kind = f.type.startsWith('image/') ? 'image' : f.type.startsWith('audio/') ? 'audio' : null;
+  if (!kind) { toast('Только фото и аудио'); return; }
+  const data = await f.arrayBuffer();
+  sendMsg({ t:'msg', id:uid(), kind, name:f.name, mime:f.type, data, ts:Date.now() });
+}
+
+// ---------- render ----------
+function fmt(ts){ return new Date(ts).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}); }
+function btn(label, cls, fn){ const b=document.createElement('button'); b.textContent=label; if(cls) b.className=cls; b.onclick=fn; return b; }
+
+function addMessage(m, mine){
+  if (msgs.has(m.id)) return;
+  const el = document.createElement('div');
+  el.className = 'msg' + (mine ? ' mine' : '');
+  let url = null;
+  if (m.kind === 'text') {
+    const t = document.createElement('div'); t.className='text'; t.textContent = m.text; el.appendChild(t);
+  } else {
+    url = URL.createObjectURL(new Blob([m.data], { type: m.mime }));
+    if (m.kind === 'image') { const i=document.createElement('img'); i.src=url; i.onclick=()=>window.open(url,'_blank'); el.appendChild(i); }
+    else { const a=document.createElement('audio'); a.controls=true; a.src=url; el.appendChild(a); }
+  }
+  const meta = document.createElement('div'); meta.className='meta';
+  const time = document.createElement('span'); time.className='time'; time.textContent = fmt(m.ts); meta.appendChild(time);
+  if (m.kind === 'text') {
+    meta.appendChild(btn('Копировать','',async()=>{ try{ await navigator.clipboard.writeText(m.text); toast('Скопировано'); }catch{ toast('Не удалось скопировать'); } }));
+  } else {
+    meta.appendChild(btn('Скачать','',()=>{ const a=document.createElement('a'); a.href=url; a.download=m.name||('file.'+(m.mime.split('/')[1]||'bin')); document.body.appendChild(a); a.click(); a.remove(); }));
+  }
+  meta.appendChild(btn('У меня','del',()=>removeMessage(m.id, false)));
+  if (mine) meta.appendChild(btn('У всех','del',()=>deleteForAll(m.id)));
+  el.appendChild(meta);
+  msgs.set(m.id, { m, mine, el, url });
+  const list = $('list');
+  const stick = list.scrollTop + list.clientHeight >= list.scrollHeight - 80;
+  list.appendChild(el);
+  if (stick || mine) list.scrollTop = list.scrollHeight;
+}
+function removeMessage(id, byOther){
+  const r = msgs.get(id); if (!r) return;
+  if (r.url) URL.revokeObjectURL(r.url);
+  if (byOther) {
+    r.el.innerHTML = '<div class="gone">Сообщение удалено собеседником</div>';
+    msgs.set(id, { ...r, url:null }); // оставляем заглушку
+    setTimeout(() => { r.el.remove(); msgs.delete(id); }, 4000);
+  } else { r.el.remove(); msgs.delete(id); }
+}
+function deleteForAll(id){
+  const r = msgs.get(id); if (!r || !r.mine) return;
+  if (conn && conn.open) conn.send({ t:'del', id });
+  else toast('Собеседник не в сети — удалено только у вас');
+  removeMessage(id, false);
+}
+
+// ---------- voice recording ----------
+let rec = null, chunks = [];
+async function toggleRec(){
+  if (rec) { rec.stop(); return; }
+  if (!canSend()) return;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    rec = new MediaRecorder(stream); chunks = [];
+    rec.ondataavailable = e => chunks.push(e.data);
+    rec.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop());
+      const type = rec.mimeType || 'audio/webm'; rec = null; $('rec').classList.remove('on'); $('rec').textContent='🎤';
+      const blob = new Blob(chunks, { type });
+      if (blob.size > MAX_BYTES) { toast('Запись слишком большая'); return; }
+      const ext = type.includes('mp4') ? 'm4a' : type.includes('ogg') ? 'ogg' : 'webm';
+      sendMsg({ t:'msg', id:uid(), kind:'audio', name:'voice-'+Date.now()+'.'+ext, mime:type, data: await blob.arrayBuffer(), ts:Date.now() });
+    };
+    rec.start(); $('rec').classList.add('on'); $('rec').textContent='⏹';
+  } catch { toast('Нет доступа к микрофону'); }
+}
+
+// ---------- UI wiring ----------
+function autoGrow(){ const t=$('text'); t.style.height='auto'; t.style.height=Math.min(t.scrollHeight,120)+'px'; }
+$('create').onclick = createRoom;
+$('join').onclick = () => joinRoom($('code').value);
+$('code').onkeydown = e => { if (e.key==='Enter') joinRoom($('code').value); };
+$('send').onclick = sendText;
+$('text').oninput = autoGrow;
+$('text').onkeydown = e => { if (e.key==='Enter' && !e.shiftKey && !/Mobi|Android/i.test(navigator.userAgent)) { e.preventDefault(); sendText(); } };
+$('attach').onclick = () => $('file').click();
+$('file').onchange = async e => { for (const f of e.target.files) await sendFile(f); e.target.value=''; };
+$('rec').onclick = toggleRec;
+$('share').onclick = async () => {
+  const link = location.origin + location.pathname + '#' + roomCode;
+  try { await navigator.clipboard.writeText(link); toast('Ссылка скопирована'); } catch { prompt('Ссылка:', link); }
+};
+if (location.hash.length > 1) joinRoom(location.hash.slice(1));
+</script>
+</body>
+</html>
